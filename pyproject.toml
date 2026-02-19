@@ -1,0 +1,14 @@
+[project]
+name = "tgsumbythemebot"
+version = "0.1.0"
+description = "Telegram bot for group topic summaries and open question analysis"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=2.0.0,<3.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "python-telegram-bot>=21.0.0,<22.0.0",
+]
+
+[tool.uv]
+package = false
