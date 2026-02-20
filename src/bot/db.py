@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
     telegram_message_id INTEGER NOT NULL,
+    reply_to_telegram_message_id INTEGER,
     user_id INTEGER NOT NULL,
     username TEXT,
     display_name TEXT NOT NULL,
@@ -79,6 +80,11 @@ class Database:
     def initialize(self) -> None:
         with self._lock:
             self._connection.executescript(SCHEMA_SQL)
+            self._ensure_column(
+                table_name="messages",
+                column_name="reply_to_telegram_message_id",
+                column_definition="INTEGER",
+            )
             self._connection.commit()
 
     @contextmanager
@@ -98,3 +104,11 @@ class Database:
         with self._lock:
             self._connection.close()
 
+    def _ensure_column(self, table_name: str, column_name: str, column_definition: str) -> None:
+        rows = self._connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing_columns = {row["name"] for row in rows}
+        if column_name in existing_columns:
+            return
+        self._connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )

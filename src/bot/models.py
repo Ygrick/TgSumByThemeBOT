@@ -18,6 +18,7 @@ class Message:
     id: int
     chat_id: int
     telegram_message_id: int
+    reply_to_telegram_message_id: int | None
     user_id: int
     username: str | None
     display_name: str
@@ -50,4 +51,3 @@ class OpenQuestion:
     asked_by: str
     details: str
     source_message_ids: list[int]
-

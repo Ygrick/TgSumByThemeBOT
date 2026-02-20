@@ -67,6 +67,7 @@ class Repository:
         self,
         chat_id: int,
         telegram_message_id: int,
+        reply_to_telegram_message_id: int | None,
         user_id: int,
         username: str | None,
         display_name: str,
@@ -78,10 +79,20 @@ class Repository:
             cursor.execute(
                 """
                 INSERT INTO messages (
-                    chat_id, telegram_message_id, user_id, username, display_name, text, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    chat_id, telegram_message_id, reply_to_telegram_message_id,
+                    user_id, username, display_name, text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (chat_id, telegram_message_id, user_id, username, display_name, text, created),
+                (
+                    chat_id,
+                    telegram_message_id,
+                    reply_to_telegram_message_id,
+                    user_id,
+                    username,
+                    display_name,
+                    text,
+                    created,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -91,7 +102,8 @@ class Repository:
         with self._db.cursor() as cursor:
             rows = cursor.execute(
                 """
-                SELECT id, chat_id, telegram_message_id, user_id, username, display_name, text, created_at
+                SELECT id, chat_id, telegram_message_id, reply_to_telegram_message_id,
+                       user_id, username, display_name, text, created_at
                 FROM messages
                 WHERE chat_id = ?
                   AND created_at >= ?
@@ -102,6 +114,53 @@ class Repository:
                 (chat_id, window_start.isoformat(), window_end.isoformat(), limit),
             ).fetchall()
         return [self._message_from_row(row) for row in reversed(rows)]
+
+    def get_messages_by_ids(self, chat_id: int, message_ids: list[int]) -> list[Message]:
+        unique_ids = sorted(set(message_ids))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._db.cursor() as cursor:
+            rows = cursor.execute(
+                f"""
+                SELECT id, chat_id, telegram_message_id, reply_to_telegram_message_id,
+                       user_id, username, display_name, text, created_at
+                FROM messages
+                WHERE chat_id = ?
+                  AND id IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                (chat_id, *unique_ids),
+            ).fetchall()
+        return [self._message_from_row(row) for row in rows]
+
+    def get_first_messages_for_topics(self, chat_id: int, topic_ids: list[int]) -> dict[int, Message]:
+        unique_ids = sorted(set(topic_ids))
+        if not unique_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self._db.cursor() as cursor:
+            rows = cursor.execute(
+                f"""
+                SELECT tm.topic_id AS topic_id,
+                       m.id, m.chat_id, m.telegram_message_id, m.reply_to_telegram_message_id,
+                       m.user_id, m.username, m.display_name, m.text, m.created_at
+                FROM topic_messages tm
+                JOIN messages m ON m.id = tm.message_id
+                WHERE m.chat_id = ?
+                  AND tm.topic_id IN ({placeholders})
+                ORDER BY tm.topic_id ASC, m.created_at ASC, m.id ASC
+                """,
+                (chat_id, *unique_ids),
+            ).fetchall()
+
+        result: dict[int, Message] = {}
+        for row in rows:
+            topic_id = int(row["topic_id"])
+            if topic_id in result:
+                continue
+            result[topic_id] = self._message_from_row(row)
+        return result
 
     def create_topics(
         self,
@@ -229,6 +288,7 @@ class Repository:
             id=row["id"],
             chat_id=row["chat_id"],
             telegram_message_id=row["telegram_message_id"],
+            reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             user_id=row["user_id"],
             username=row["username"],
             display_name=row["display_name"],

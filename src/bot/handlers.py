@@ -31,24 +31,20 @@ logger = logging.getLogger(__name__)
 TOPIC_CALLBACK_PREFIX = "topic:"
 BOT_COMMANDS = [
     BotCommand("help", "Подробная справка по командам"),
-    BotCommand("examples", "Короткие примеры использования"),
     BotCommand("notify_all", "Оповестить всех участников"),
     BotCommand("analyze_topics", "Топ тем за 10 часов"),
     BotCommand("latest_topics", "Последние 10 тем"),
     BotCommand("topic", "Сводка темы по id"),
-    BotCommand("open_questions", "Открытые вопросы за 24 часа"),
 ]
 
 
 def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("examples", examples_command))
     application.add_handler(CommandHandler("notify_all", notify_all_command))
     application.add_handler(CommandHandler("analyze_topics", analyze_topics_command))
     application.add_handler(CommandHandler("latest_topics", latest_topics_command))
     application.add_handler(CommandHandler("topic", topic_command))
-    application.add_handler(CommandHandler("open_questions", open_questions_command))
 
     application.add_handler(
         CallbackQueryHandler(topic_callback, pattern=rf"^{TOPIC_CALLBACK_PREFIX}\d+$")
@@ -75,13 +71,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help_text = build_help_text()
     if update.message:
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
-
-
-async def examples_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await remember_sender(update, context)
-    if not update.message:
-        return
-    await update.message.reply_text(build_examples_text(), parse_mode=ParseMode.HTML)
 
 
 async def notify_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -125,18 +114,13 @@ async def analyze_topics_command(update: Update, context: ContextTypes.DEFAULT_T
         await status.edit_text("Недостаточно сообщений для анализа тем.")
         return
 
-    lines = ["<b>Топ тем за последние 10 часов</b>:"]
+    lines: list[str] = []
     keyboard = []
     for topic in topics:
-        lines.append(
-            f"<b>{topic.id}.</b> {html.escape(topic.title)} "
-            f"<i>(сообщений:</i> <code>{topic.message_count}</code><i>)</i>"
-        )
+        lines.append(f"<b>{topic.id}.</b> {html.escape(topic.title)}")
         keyboard.append(
             [InlineKeyboardButton(text=f"{topic.id}. {topic.title[:50]}", callback_data=f"{TOPIC_CALLBACK_PREFIX}{topic.id}")]
         )
-    lines.append("")
-    lines.append("Нажмите кнопку ниже или используйте <code>/topic &lt;id&gt;</code>.")
     await status.edit_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
@@ -154,15 +138,42 @@ async def latest_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not topics:
         await update.message.reply_text("В БД пока нет сохранённых тем.")
         return
+    topics = list(reversed(topics))
 
-    lines = ["<b>Последние 10 тем</b>:"]
+    first_messages = repository.get_first_messages_for_topics(
+        chat_id=update.effective_chat.id,
+        topic_ids=[topic.id for topic in topics],
+    )
+
+    lines: list[str] = []
+    keyboard: list[list[InlineKeyboardButton]] = []
     for topic in topics:
-        lines.append(
-            f"<b>{topic.id}.</b> {html.escape(topic.title)} "
-            f"<code>[{format_timestamp(topic.created_at)}]</code>"
+        first_message = first_messages.get(topic.id)
+        date_text = format_ru_day_month(first_message.created_at if first_message else topic.created_at)
+        link = (
+            build_chat_message_link(
+                chat_id=update.effective_chat.id,
+                chat_username=update.effective_chat.username,
+                message_id=first_message.telegram_message_id,
+            )
+            if first_message
+            else None
         )
-    lines.append("Для сводки: <code>/topic &lt;id&gt;</code>.")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        if link:
+            lines.append(
+                f"<b>{topic.id}.</b> {html.escape(topic.title)} "
+                f"<a href=\"{html.escape(link, quote=True)}\"><i>({date_text})</i></a>"
+            )
+        else:
+            lines.append(f"<b>{topic.id}.</b> {html.escape(topic.title)} <i>({date_text})</i>")
+        keyboard.append(
+            [InlineKeyboardButton(text=f"{topic.id}. {topic.title[:50]}", callback_data=f"{TOPIC_CALLBACK_PREFIX}{topic.id}")]
+        )
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,35 +209,16 @@ async def topic_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_topic_summary(update.effective_chat.id, topic_id, query.message.reply_text, context)
 
 
-async def open_questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
-        return
-    await remember_sender(update, context)
-
-    status = await update.message.reply_text("Анализирую открытые вопросы за последние 24 часа...")
-    analytics = get_analytics(context)
-    questions = await analytics.analyze_open_questions(update.effective_chat.id)
-
-    if not questions:
-        await status.edit_text("Открытых вопросов за последние 24 часа не найдено.")
-        return
-
-    lines = ["<b>Открытые вопросы за последние 24 часа</b>:"]
-    for index, question in enumerate(questions, start=1):
-        lines.append(f"<b>{index}.</b> {html.escape(question.question)}")
-        lines.append(f"<i>Автор:</i> {html.escape(question.asked_by)}")
-        if question.details:
-            lines.append(f"<i>Комментарий:</i> {html.escape(question.details)}")
-        lines.append("")
-    await status.edit_text("\n".join(lines).strip(), parse_mode=ParseMode.HTML)
-
-
 async def track_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_chat or not update.effective_user or not update.message:
+        return
+    if update.effective_user.is_bot:
         return
     text = (update.message.text or "").strip()
     if not text:
         return
+    if len(text) > 4000:
+        text = text[:4000]
 
     repository = get_repository(context)
     repository.upsert_participant(
@@ -238,6 +230,11 @@ async def track_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     repository.save_message(
         chat_id=update.effective_chat.id,
         telegram_message_id=update.message.message_id,
+        reply_to_telegram_message_id=(
+            update.message.reply_to_message.message_id
+            if update.message.reply_to_message
+            else None
+        ),
         user_id=update.effective_user.id,
         username=update.effective_user.username,
         display_name=build_display_name(update.effective_user.first_name, update.effective_user.last_name),
@@ -271,11 +268,8 @@ async def send_topic_summary(
         return
 
     text = (
-        f"<b>Тема #{topic.id}:</b> {html.escape(topic.title)}\n"
-        f"<b>Сводка:</b> {html.escape(topic.summary)}\n"
-        f"<b>Сообщений в теме:</b> <code>{topic.message_count}</code>\n"
-        f"<b>Окно анализа:</b> "
-        f"<code>{format_timestamp(topic.window_start)} - {format_timestamp(topic.window_end)}</code>"
+        f"<b>{html.escape(topic.title)}</b>\n"
+        f"{html.escape(topic.summary)}"
     )
     await sender(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -306,12 +300,37 @@ def build_display_name(first_name: str | None, last_name: str | None) -> str:
     return display or "unknown"
 
 
-def format_timestamp(value: str) -> str:
+def format_ru_day_month(value: str) -> str:
+    months = {
+        1: "января",
+        2: "февраля",
+        3: "марта",
+        4: "апреля",
+        5: "мая",
+        6: "июня",
+        7: "июля",
+        8: "августа",
+        9: "сентября",
+        10: "октября",
+        11: "ноября",
+        12: "декабря",
+    }
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value).astimezone(timezone.utc)
     except ValueError:
         return value
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"{parsed.day} {months.get(parsed.month, '')}".strip()
+
+
+def build_chat_message_link(chat_id: int, chat_username: str | None, message_id: int) -> str | None:
+    if chat_username:
+        return f"https://t.me/{chat_username}/{message_id}"
+    if chat_id >= 0:
+        return None
+    raw_chat = str(abs(chat_id))
+    if raw_chat.startswith("100"):
+        raw_chat = raw_chat[3:]
+    return f"https://t.me/c/{raw_chat}/{message_id}"
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,28 +339,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_help_text() -> str:
     return (
-        "<b>Команды</b>:\n"
-        "/notify_all [текст] - оповестить участников из БД (текст необязателен).\n"
-        "/analyze_topics - найти и сохранить топ тем за 10 часов.\n"
-        "/topic &lt;id&gt; - показать сводку темы из БД.\n"
-        "/latest_topics - показать последние 10 тем.\n"
-        "/open_questions - показать открытые вопросы за 24 часа.\n"
-        "/examples - 2 готовых сценария использования.\n"
-    )
-
-
-def build_examples_text() -> str:
-    return (
-        "<b>Пример 1 (ежедневный обзор)</b>:\n"
-        "1) <code>/analyze_topics</code>\n"
-        "2) Нажмите кнопку нужной темы или <code>/topic &lt;id&gt;</code>\n"
-        "3) <code>/open_questions</code>\n"
-        "Результат: краткая картина обсуждений + список незакрытых вопросов.\n"
-        "\n"
-        "<b>Пример 2 (срочное оповещение)</b>:\n"
-        "1) <code>/notify_all</code>\n"
-        "2) <code>/notify_all Релиз откладываем на 30 минут, проверьте статусы задач.</code>\n"
-        "Результат: бот отправит сообщение и упомянет известных участников."
+        "Команды:\n"
+        "/notify_all [текст] - позвать всех участников.\n"
+        "/analyze_topics - собрать актуальные темы.\n"
+        "/latest_topics - показать последние темы.\n"
+        "/topic &lt;id&gt; - открыть сводку темы.\n"
     )
 
 

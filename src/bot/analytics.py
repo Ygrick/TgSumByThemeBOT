@@ -26,7 +26,8 @@ class AnalyticsService:
             window_end=window_end,
             limit=self._max_messages,
         )
-        if not messages:
+        prepared_messages = self._prepare_messages(messages)
+        if not prepared_messages:
             return []
 
         drafts: list[TopicDraft] = []
@@ -35,17 +36,18 @@ class AnalyticsService:
                 system_prompt=(
                     "Ты анализируешь групповые чаты и возвращаешь только строгий JSON. "
                     "Выделяй глобальные темы по смыслу и пиши только по-русски. "
-                    "Все текстовые поля (title, summary) должны быть на русском языке."
+                    "Все текстовые поля (title, summary) должны быть на русском языке. "
+                    "Пиши дружелюбно и естественно для обычной беседы."
                 ),
-                user_prompt=self._build_topics_prompt(messages),
+                user_prompt=self._build_topics_prompt(prepared_messages),
                 temperature=0.1,
             )
-            drafts = self._parse_topics_response(response, messages)
+            drafts = self._parse_topics_response(response, prepared_messages)
         except Exception:
             logger.exception("Topic analysis failed, fallback strategy is used.")
 
         if not drafts:
-            drafts = self._fallback_topics(messages)
+            drafts = self._fallback_topics(prepared_messages)
 
         return self._repository.create_topics(
             chat_id=chat_id,
@@ -63,7 +65,8 @@ class AnalyticsService:
             window_end=window_end,
             limit=self._max_messages,
         )
-        if not messages:
+        prepared_messages = self._prepare_messages(messages)
+        if not prepared_messages:
             self._repository.save_open_question_report(chat_id, [], window_start, window_end)
             return []
 
@@ -75,15 +78,15 @@ class AnalyticsService:
                     "Возвращай только строгий JSON. "
                     "Все текстовые поля должны быть на русском языке."
                 ),
-                user_prompt=self._build_open_questions_prompt(messages),
+                user_prompt=self._build_open_questions_prompt(prepared_messages),
                 temperature=0.1,
             )
-            questions = self._parse_open_questions_response(response, messages)
+            questions = self._parse_open_questions_response(response, prepared_messages)
         except Exception:
             logger.exception("Open questions analysis failed, fallback strategy is used.")
 
         if not questions:
-            questions = self._fallback_open_questions(messages)
+            questions = self._fallback_open_questions(prepared_messages)
 
         self._repository.save_open_question_report(chat_id, questions, window_start, window_end)
         return questions
@@ -94,8 +97,12 @@ class AnalyticsService:
         lines.append("Задача:")
         lines.append("1) Найди топ-3 глобальные темы (или меньше, если данных мало).")
         lines.append("2) Названия тем должны быть короткими и только на русском языке.")
-        lines.append("3) Для каждой темы дай краткую сводку (1-3 предложения), только на русском языке.")
-        lines.append("4) Верни строгий JSON по схеме:")
+        lines.append("3) Для каждой темы дай сводку 2-4 предложения, только на русском языке.")
+        lines.append(
+            "4) По возможности упомяни: что обсуждали, к чему пришли, что осталось нерешенным. "
+            "Если каких-то пунктов нет, не выдумывай их."
+        )
+        lines.append("5) Верни строгий JSON по схеме:")
         lines.append(
             """
 {
@@ -120,7 +127,8 @@ class AnalyticsService:
         lines.append("1) Найди открытые (незакрытые) вопросы в обсуждении.")
         lines.append("2) Включай только те вопросы, которые всё еще остаются без ответа.")
         lines.append("3) Все текстовые поля должны быть только на русском языке.")
-        lines.append("4) Верни строгий JSON:")
+        lines.append("4) Для каждого вопроса добавь поле context с кратким контекстом (до 160 символов).")
+        lines.append("5) Верни строгий JSON:")
         lines.append(
             """
 {
@@ -128,24 +136,27 @@ class AnalyticsService:
     {
       "question": "string",
       "asked_by": "string",
+      "context": "string",
       "details": "string",
-      "source_indexes": [1, 2]
+      "source_indexes": [1, 2, 3]
     }
   ]
 }
             """.strip()
         )
         lines.append("Максимум 10 элементов.")
+        lines.append("source_indexes должны включать сам вопрос и соседние по смыслу реплики.")
         lines.append("Не добавляй текст вне JSON.")
         return "\n".join(lines)
 
-    @staticmethod
-    def _messages_to_indexed_lines(messages: list[Message]) -> str:
-        lines = ["Messages:"]
+    def _messages_to_indexed_lines(self, messages: list[Message]) -> str:
+        lines = ["Сообщения:"]
         for index, message in enumerate(messages, start=1):
             username = f"@{message.username}" if message.username else message.display_name
-            clean_text = " ".join(message.text.split())
-            lines.append(f"[{index}] {message.created_at} | {username}: {clean_text}")
+            clean_text = self._normalize_message_text(message.text)
+            if len(clean_text) > 280:
+                clean_text = clean_text[:280].rstrip() + "…"
+            lines.append(f"[{index}] {username}: {clean_text}")
         return "\n".join(lines)
 
     def _parse_topics_response(self, payload: Any, messages: list[Message]) -> list[TopicDraft]:
@@ -191,18 +202,23 @@ class AnalyticsService:
                 continue
             question = str(item.get("question", "")).strip()
             asked_by = str(item.get("asked_by", "")).strip()
+            context_hint = str(item.get("context", "")).strip()
             details = str(item.get("details", "")).strip()
             source_indexes = item.get("source_indexes", [])
             message_ids = self._map_source_indexes_to_ids(source_indexes, messages)
             if not question:
                 continue
+            if not message_ids:
+                continue
             if not asked_by and message_ids:
                 asked_by = self._asked_by_from_message_id(message_ids[0], messages)
+            local_context = self._build_context_from_source_ids(message_ids, messages)
+            normalized_details = context_hint or details or local_context
             result.append(
                 OpenQuestion(
                     question=question[:500],
                     asked_by=asked_by or "unknown",
-                    details=details[:800],
+                    details=normalized_details[:800],
                     source_message_ids=message_ids,
                 )
             )
@@ -213,16 +229,16 @@ class AnalyticsService:
     def _fallback_topics(self, messages: list[Message]) -> list[TopicDraft]:
         if not messages:
             return []
-        joined = "; ".join(" ".join(msg.text.split()) for msg in messages[:8])
         summary = (
-            "Автоматическая сводка без LLM-кластеризации: "
-            + (joined[:1000] if joined else "Недостаточно данных для детализации.")
+            "Не удалось выполнить семантический анализ. "
+            "Сохранен общий срез сообщений из окна анализа. "
+            "Повторите команду позже для точной кластеризации."
         )
         return [
             TopicDraft(
-                title="Общее обсуждение",
+                title="Общий срез обсуждения",
                 summary=summary,
-                source_message_ids=[message.id for message in messages[:30]],
+                source_message_ids=[message.id for message in messages[:20]],
             )
         ]
 
@@ -247,13 +263,16 @@ class AnalyticsService:
             if answered:
                 continue
 
+            context_ids = [msg.id for msg in messages[max(0, index - 1) : min(len(messages), index + 2)]]
+            context_text = self._build_context_from_source_ids(context_ids, messages)
             asked_by = f"@{message.username}" if message.username else message.display_name
             result.append(
                 OpenQuestion(
                     question=text[:500],
                     asked_by=asked_by,
-                    details="Определено эвристикой: в ближайших ответах не найдено явного закрытия вопроса.",
-                    source_message_ids=[message.id],
+                    details=context_text
+                    or "Определено эвристикой: в ближайших ответах не найдено явного закрытия вопроса.",
+                    source_message_ids=context_ids or [message.id],
                 )
             )
             if len(result) == 10:
@@ -280,3 +299,39 @@ class AnalyticsService:
                 continue
             return f"@{message.username}" if message.username else message.display_name
         return "unknown"
+
+    def _prepare_messages(self, messages: list[Message]) -> list[Message]:
+        prepared: list[Message] = []
+        previous_key: tuple[int, str] | None = None
+        for message in messages:
+            normalized = self._normalize_message_text(message.text)
+            if not normalized:
+                continue
+            if len(normalized) < 3 and "?" not in normalized:
+                continue
+            key = (message.user_id, normalized.casefold())
+            if key == previous_key:
+                continue
+            previous_key = key
+            prepared.append(message)
+        return prepared
+
+    def _build_context_from_source_ids(self, message_ids: list[int], messages: list[Message]) -> str:
+        if not message_ids:
+            return ""
+        by_id = {message.id: message for message in messages}
+        parts: list[str] = []
+        for message_id in message_ids[:3]:
+            message = by_id.get(message_id)
+            if not message:
+                continue
+            author = f"@{message.username}" if message.username else message.display_name
+            text = self._normalize_message_text(message.text)
+            if len(text) > 110:
+                text = text[:110].rstrip() + "…"
+            parts.append(f"{author}: {text}")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _normalize_message_text(text: str) -> str:
+        return " ".join(text.split())
